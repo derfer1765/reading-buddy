@@ -454,8 +454,6 @@ function saveState() {
 let currentWord = '';
 let currentDiff = 'easy';
 let isListening = false;
-let recognition = null;
-let recognitionId = 0;             // increments to invalidate stale recognition callbacks
 let safetyTimer = null;
 let wordShown = false;
 let correctSinceLastDragon = 0;   // track milestone
@@ -690,19 +688,117 @@ function toggleMic() {
   }
 }
 
+// ─── Singleton SpeechRecognition instance ─────────────────────────
+// iOS Safari leaks audio sessions when you rapidly create/destroy
+// SpeechRecognition instances. After 2-4 cycles the audio system
+// locks up and new instances fail silently. The fix is to create
+// ONE instance per page session and reuse it — calling .start() and
+// .stop() repeatedly on the same object. This is the documented
+// best practice for the Web Speech API on iOS.
+let SR_INSTANCE = null;
+let SR_STATE = 'idle';        // 'idle' | 'starting' | 'listening' | 'stopping'
+let sessionTranscript = '';   // best transcript captured so far this session
+let sessionAlts = [];
+let sessionEvalRequested = false;  // true once we detect a final/confident match
+let awaitingNextWord = false; // true between correct answer and pickWord firing
+
+function buildSR() {
+  if (SR_INSTANCE) return SR_INSTANCE;
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) return null;
+  const r = new SR();
+  r.continuous     = false;
+  r.interimResults = true;
+  r.maxAlternatives = 3;
+  r.lang = 'en-US';
+
+  r.onstart = () => {
+    SR_STATE = 'listening';
+    isListening = true;
+    micBtn('listening');
+    const hint = document.getElementById('micHint');
+    if (hint) hint.textContent = 'Listening… say the word!';
+    clearTimeout(safetyTimer);
+    safetyTimer = setTimeout(() => {
+      // safety cap — stop and let onend handle evaluation
+      if (SR_STATE === 'listening') {
+        SR_STATE = 'stopping';
+        try { r.stop(); } catch(e) {}
+      }
+    }, 3000);
+  };
+
+  r.onresult = (event) => {
+    const result = event.results[event.results.length - 1];
+    const transcript = result[0].transcript.trim().toLowerCase();
+    const alts = [];
+    for (let a = 0; a < Math.min(result.length, 3); a++) {
+      alts.push(result[a].transcript.trim().toLowerCase());
+    }
+    const heardEl = document.getElementById('heardText');
+    if (heardEl) heardEl.textContent = `I heard: "${transcript}"`;
+    sessionTranscript = transcript;
+    sessionAlts = alts;
+
+    const target = currentWord.toLowerCase();
+    const normalized = resolveWord(transcript, target);
+    // On final result OR confident match, stop to release audio session.
+    // The actual evaluation happens in onend, AFTER the session releases.
+    if ((result.isFinal || normalized === target) && !sessionEvalRequested) {
+      sessionEvalRequested = true;
+      if (SR_STATE === 'listening') {
+        SR_STATE = 'stopping';
+        try { r.stop(); } catch(e) {}
+      }
+    }
+  };
+
+  r.onerror = (e) => {
+    clearTimeout(safetyTimer);
+    if (e.error === 'not-allowed') {
+      setFeedback('🎙️ Microphone access denied. Check Settings → Safari → Microphone.');
+      sessionTranscript = ''; sessionAlts = []; sessionEvalRequested = false;
+      SR_STATE = 'idle'; resetMicState();
+    } else if (e.error === 'no-speech') {
+      setFeedback("Didn't hear anything — tap and try again!");
+      sessionTranscript = ''; sessionAlts = []; sessionEvalRequested = false;
+      SR_STATE = 'idle'; resetMicState();
+    }
+    // for other errors (including 'aborted'), let onend handle cleanup
+  };
+
+  r.onend = () => {
+    clearTimeout(safetyTimer);
+    SR_STATE = 'idle';
+    isListening = false;
+
+    // If we have any captured speech, evaluate it now (audio session is released)
+    if (sessionTranscript) {
+      const t = sessionTranscript, a = sessionAlts;
+      sessionTranscript = ''; sessionAlts = []; sessionEvalRequested = false;
+      evaluateAnswer(t.replace(/\s/g, ''), a);
+    } else {
+      sessionEvalRequested = false;
+      resetMicState();
+    }
+  };
+
+  SR_INSTANCE = r;
+  return r;
+}
+
 function startListening() {
-  if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+  const r = buildSR();
+  if (!r) {
     setFeedback("Speech recognition isn't supported here. Try Chrome on desktop or Safari on iOS.");
     return;
   }
 
-  // Hard reset any stale recognition before starting fresh
-  if (recognition) {
-    try { recognition.onresult = recognition.onend = recognition.onerror = null; } catch(e) {}
-    try { recognition.abort(); } catch(e) {}
-    recognition = null;
-  }
-  clearTimeout(safetyTimer);
+  // Ignore taps while a session is mid-flight — wait for it to finish.
+  if (SR_STATE !== 'idle') return;
+  // Ignore taps while a word transition is pending (e.g. user mashes mic
+  // between "correct" feedback and the next word appearing).
+  if (awaitingNextWord) return;
 
   if (!wordShown) {
     wordShown = true;
@@ -710,113 +806,48 @@ function startListening() {
     document.getElementById('wordLabel').textContent = 'Read this word!';
   }
 
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const rec = new SR();
-  recognition = rec;
-  const myId = ++recognitionId;           // tag this instance to ignore stale callbacks
-  rec.continuous      = false;
-  rec.interimResults  = true;             // fast first guess; we act on it immediately
-  rec.maxAlternatives = 3;
-  rec.lang            = 'en-US';
+  // Clean session state
+  sessionTranscript = '';
+  sessionAlts = [];
+  sessionEvalRequested = false;
+  clearTimeout(safetyTimer);
 
-  let evaluationDone = false;
-  let bestTranscript = '';
-  let bestAlts       = [];
-
-  const SAFETY_MS = 2500;  // hard cap so it never hangs
-
-  const isStale = () => myId !== recognitionId;
-
-  const finish = (transcript, alts) => {
-    if (evaluationDone || isStale()) return;
-    evaluationDone = true;
-    clearTimeout(safetyTimer);
-    try { rec.stop(); } catch(e) {}
-    evaluateAnswer(transcript.replace(/\s/g, ''), alts);
-  };
-
-  rec.onstart = () => {
-    if (isStale()) return;
-    isListening = true;
-    micBtn('listening');
-    document.getElementById('micHint').textContent = 'Listening… say the word!';
-    safetyTimer = setTimeout(() => {
-      // time's up — use best guess we have, or just reset
-      if (!evaluationDone) {
-        if (bestTranscript) finish(bestTranscript, bestAlts);
-        else { try { rec.abort(); } catch(e){} resetMicState(); }
-      }
-    }, SAFETY_MS);
-  };
-
-  rec.onresult = (event) => {
-    if (isStale()) return;
-    const r = event.results[event.results.length - 1];
-    const transcript = r[0].transcript.trim().toLowerCase();
-    const alts = [];
-    for (let a = 0; a < Math.min(r.length, 3); a++) alts.push(r[a].transcript.trim().toLowerCase());
-
-    document.getElementById('heardText').textContent = `I heard: "${transcript}"`;
-    bestTranscript = transcript;
-    bestAlts       = alts;
-
-    const target = currentWord.toLowerCase();
-    const normalized = resolveWord(transcript, target);
-
-    // Act the INSTANT we have a confident match — don't wait for "final"
-    if (r.isFinal || normalized === target) {
-      finish(transcript, alts);
-    }
-  };
-
-  rec.onerror = (e) => {
-    if (isStale()) return;
-    clearTimeout(safetyTimer);
-    if (e.error === 'not-allowed') {
-      setFeedback('🎙️ Microphone access denied. Check Settings → Safari → Microphone.');
-      resetMicState();
-    } else if (e.error === 'no-speech') {
-      setFeedback("Didn't hear anything — tap and try again!");
-      resetMicState();
-    } else if (e.error !== 'aborted') {
-      // on a genuine error, fall back to best guess if we have one
-      if (bestTranscript && !evaluationDone) finish(bestTranscript, bestAlts);
-      else resetMicState();
-    }
-  };
-
-  rec.onend = () => {
-    if (isStale()) return;
-    clearTimeout(safetyTimer);
-    if (!evaluationDone) {
-      if (bestTranscript) finish(bestTranscript, bestAlts);
-      else resetMicState();
-    }
-  };
-
+  SR_STATE = 'starting';
   try {
-    rec.start();
+    r.start();
   } catch(e) {
-    // start() can throw if a previous session didn't fully release; reset and let user retap
-    resetMicState();
+    // iOS may throw if previous session is still releasing. Try once more shortly.
+    SR_STATE = 'idle';
+    setTimeout(() => {
+      if (SR_STATE !== 'idle') return;
+      SR_STATE = 'starting';
+      try { r.start(); }
+      catch(e2) { SR_STATE = 'idle'; resetMicState(); }
+    }, 150);
   }
 }
 
-// Reset mic UI/state without touching recognitionId (used for clean idle)
+// Reset mic UI/state (called when no active session)
 function resetMicState() {
   isListening = false;
   micBtn('idle');
-  document.getElementById('micHint').textContent = 'Tap mic, then say the word';
+  const hint = document.getElementById('micHint');
+  if (hint) hint.textContent = 'Tap mic, then say the word';
 }
 
 function stopListening() {
   clearTimeout(safetyTimer);
-  recognitionId++;  // invalidate any in-flight callbacks
-  if (recognition) {
-    try { recognition.onresult = recognition.onend = recognition.onerror = null; } catch(e) {}
-    try { recognition.abort(); } catch(e) {}
-    recognition = null;
+  // Web Speech path: stop the singleton, discard any captured speech so onend doesn't evaluate
+  sessionTranscript = '';
+  sessionAlts = [];
+  sessionEvalRequested = false;
+  awaitingNextWord = false;
+  if (SR_INSTANCE && (SR_STATE === 'listening' || SR_STATE === 'starting')) {
+    SR_STATE = 'stopping';
+    try { SR_INSTANCE.stop(); } catch(e) {}
+    // onend will fire async and reset state
   }
+  // Whisper path cleanup (desktop Safari only)
   if (mediaRecorder && mediaRecorder.state === 'recording') {
     abortRequested = true;
     try { mediaRecorder.stop(); } catch(e) {}
@@ -905,9 +936,11 @@ function evaluateAnswer(heard, alternatives) {
 
     if (correctSinceLastDragon >= DRAGON_EVERY) {
       correctSinceLastDragon = 0;
-      setTimeout(() => showDragon(), 1000);
+      awaitingNextWord = true;
+      setTimeout(() => { awaitingNextWord = false; showDragon(); }, 1000);
     } else {
-      setTimeout(() => pickWord(), 900);
+      awaitingNextWord = true;
+      setTimeout(() => { awaitingNextWord = false; pickWord(); }, 900);
     }
   } else {
     micBtn('wrong');
