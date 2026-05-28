@@ -566,8 +566,10 @@ function setDiff(d) {
 //  SPEECH RECOGNITION
 // ═══════════════════════════════════════════════════════════════
 
-// Safari's Web Speech API is broken on desktop — use Whisper instead
-const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+// Desktop Safari's Web Speech API is broken — use Whisper instead
+// iOS Safari supports Web Speech API fine, so only route desktop Safari to Whisper
+const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+const isSafari = !isIOS && /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 
 // ── Whisper loader (Safari only) ────────────────────────────────
 async function initWhisper() {
