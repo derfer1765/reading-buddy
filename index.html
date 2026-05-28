@@ -84,6 +84,21 @@
 
     .heard-text { font-size: 0.9rem; color: #aad4f5; min-height: 1.4em; font-style: italic; }
 
+    /* mic + skip row */
+    .mic-row {
+      display: flex; align-items: center; justify-content: center; gap: 18px;
+    }
+    .skip-btn {
+      width: 54px; height: 54px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.25);
+      background: rgba(255,255,255,0.08); color: #aad4f5;
+      font-size: 1.4rem; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: all 0.15s;
+    }
+    .skip-btn:hover, .skip-btn:active {
+      background: rgba(255,255,255,0.18); transform: scale(0.95);
+    }
+
     /* mic button */
     .mic-btn {
       width: 90px; height: 90px; border-radius: 50%; border: none;
@@ -288,7 +303,10 @@
     <div class="heard-text" id="heardText"></div>
   </div>
 
-  <button class="mic-btn" id="micBtn" onclick="toggleMic()">🎙️</button>
+  <div class="mic-row">
+    <button class="mic-btn" id="micBtn" onclick="toggleMic()">🎙️</button>
+    <button class="skip-btn" id="skipBtn" onclick="skipWord()" title="Skip this word">⏭</button>
+  </div>
   <div class="mic-hint" id="micHint">Tap mic, then say the word</div>
 
   <div class="feedback-box" id="feedbackBox">Get started — tap the mic and read a word!</div>
@@ -522,6 +540,15 @@ function pickWord() {
   renderBlanks(false);
   document.getElementById('wordLabel').textContent = 'Tap the mic to hear a word';
   document.getElementById('heardText').textContent = '';
+}
+
+// Skip the current word — for when the recognizer can't hear the child
+// clearly. No XP awarded; just move on.
+function skipWord() {
+  stopListening();
+  awaitingNextWord = false;
+  setFeedback(`Skipped "${currentWord.toUpperCase()}". Here's the next one!`);
+  pickWord();
 }
 
 // ═══════════════════════════════════════════════════════════════
