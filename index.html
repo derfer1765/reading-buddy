@@ -455,6 +455,7 @@ let currentWord = '';
 let currentDiff = 'easy';
 let isListening = false;
 let recognition = null;
+let recognitionId = 0;             // increments to invalidate stale recognition callbacks
 let safetyTimer = null;
 let wordShown = false;
 let correctSinceLastDragon = 0;   // track milestone
@@ -472,6 +473,8 @@ let audioChunks     = [];
 //  SCREENS
 // ═══════════════════════════════════════════════════════════════
 function showScreen(id) {
+  // leaving the game screen: stop any active recognition
+  if (id !== 'gameScreen' && isListening) stopListening();
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
 }
@@ -555,11 +558,11 @@ function renderBlanks(revealed, heardWord) {
 //  DIFFICULTY
 // ═══════════════════════════════════════════════════════════════
 function setDiff(d) {
+  stopListening();   // stop any active recognition first to avoid mismatched target
   currentDiff = d;
   document.querySelectorAll('.diff-pill').forEach(p => p.classList.remove('active'));
   document.querySelector(`.diff-pill.${d}`).classList.add('active');
   pickWord();
-  stopListening();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -692,6 +695,15 @@ function startListening() {
     setFeedback("Speech recognition isn't supported here. Try Chrome on desktop or Safari on iOS.");
     return;
   }
+
+  // Hard reset any stale recognition before starting fresh
+  if (recognition) {
+    try { recognition.onresult = recognition.onend = recognition.onerror = null; } catch(e) {}
+    try { recognition.abort(); } catch(e) {}
+    recognition = null;
+  }
+  clearTimeout(safetyTimer);
+
   if (!wordShown) {
     wordShown = true;
     renderBlanks(true);
@@ -699,95 +711,109 @@ function startListening() {
   }
 
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  recognition = new SR();
-  recognition.continuous      = false;
-  recognition.interimResults  = !isSafari;  // Safari is unreliable with interim results
-  recognition.maxAlternatives = 3;
-  recognition.lang            = 'en-US';
+  const rec = new SR();
+  recognition = rec;
+  const myId = ++recognitionId;           // tag this instance to ignore stale callbacks
+  rec.continuous      = false;
+  rec.interimResults  = true;             // fast first guess; we act on it immediately
+  rec.maxAlternatives = 3;
+  rec.lang            = 'en-US';
 
-  let lastInterimTranscript = '';
-  let lastInterimAlts      = [];
-  let evaluationDone       = false;
-  let gotAnyResult         = false;
+  let evaluationDone = false;
+  let bestTranscript = '';
+  let bestAlts       = [];
 
-  // Safari needs more time to return a result
-  const SAFETY_MS      = isSafari ? 6000 : 4000;
-  const INTERIM_GAP_MS = isSafari ? 3500 : 2500;
+  const SAFETY_MS = 2500;  // hard cap so it never hangs
 
-  recognition.onstart = () => {
+  const isStale = () => myId !== recognitionId;
+
+  const finish = (transcript, alts) => {
+    if (evaluationDone || isStale()) return;
+    evaluationDone = true;
+    clearTimeout(safetyTimer);
+    try { rec.stop(); } catch(e) {}
+    evaluateAnswer(transcript.replace(/\s/g, ''), alts);
+  };
+
+  rec.onstart = () => {
+    if (isStale()) return;
     isListening = true;
-    abortRequested        = false;
-    lastInterimTranscript = '';
-    lastInterimAlts       = [];
-    evaluationDone        = false;
-    gotAnyResult          = false;
     micBtn('listening');
     document.getElementById('micHint').textContent = 'Listening… say the word!';
-    safetyTimer = setTimeout(() => stopListening(), SAFETY_MS);
+    safetyTimer = setTimeout(() => {
+      // time's up — use best guess we have, or just reset
+      if (!evaluationDone) {
+        if (bestTranscript) finish(bestTranscript, bestAlts);
+        else { try { rec.abort(); } catch(e){} resetMicState(); }
+      }
+    }, SAFETY_MS);
   };
 
-  recognition.onresult = (event) => {
-    gotAnyResult = true;
-    const topResult     = event.results[event.results.length - 1];
-    const topTranscript = topResult[0].transcript.trim().toLowerCase();
-    const isFinal       = topResult.isFinal;
+  rec.onresult = (event) => {
+    if (isStale()) return;
+    const r = event.results[event.results.length - 1];
+    const transcript = r[0].transcript.trim().toLowerCase();
+    const alts = [];
+    for (let a = 0; a < Math.min(r.length, 3); a++) alts.push(r[a].transcript.trim().toLowerCase());
 
-    const alternatives = [];
-    for (let a = 0; a < Math.min(topResult.length, 3); a++) {
-      alternatives.push(topResult[a].transcript.trim().toLowerCase());
-    }
+    document.getElementById('heardText').textContent = `I heard: "${transcript}"`;
+    bestTranscript = transcript;
+    bestAlts       = alts;
 
-    document.getElementById('heardText').textContent = `I heard: "${topTranscript}"`;
-    renderBlanks(false, topTranscript.replace(/\s/g, ''));
+    const target = currentWord.toLowerCase();
+    const normalized = resolveWord(transcript, target);
 
-    if (isFinal) {
-      clearTimeout(safetyTimer);
-      evaluationDone = true;
-      evaluateAnswer(topTranscript.replace(/\s/g, ''), alternatives);
-    } else {
-      // Interim result — save as fallback and reset the safety timer
-      lastInterimTranscript = topTranscript;
-      lastInterimAlts       = alternatives;
-      clearTimeout(safetyTimer);
-      safetyTimer = setTimeout(() => stopListening(), INTERIM_GAP_MS);
+    // Act the INSTANT we have a confident match — don't wait for "final"
+    if (r.isFinal || normalized === target) {
+      finish(transcript, alts);
     }
   };
 
-  recognition.onerror = (e) => {
+  rec.onerror = (e) => {
+    if (isStale()) return;
     clearTimeout(safetyTimer);
-    stopListening();
     if (e.error === 'not-allowed') {
-      setFeedback('🎙️ Microphone access denied. Check Safari → Settings → Microphone.');
-    } else if (e.error !== 'no-speech' && e.error !== 'aborted') {
-      setFeedback(`Mic issue: ${e.error}. Try again!`);
+      setFeedback('🎙️ Microphone access denied. Check Settings → Safari → Microphone.');
+      resetMicState();
+    } else if (e.error === 'no-speech') {
+      setFeedback("Didn't hear anything — tap and try again!");
+      resetMicState();
+    } else if (e.error !== 'aborted') {
+      // on a genuine error, fall back to best guess if we have one
+      if (bestTranscript && !evaluationDone) finish(bestTranscript, bestAlts);
+      else resetMicState();
     }
   };
 
-  recognition.onend = () => {
+  rec.onend = () => {
+    if (isStale()) return;
     clearTimeout(safetyTimer);
-    // Evaluate a saved interim result if recognition ended without a final event
-    if (!evaluationDone && !abortRequested && lastInterimTranscript) {
-      evaluationDone = true;
-      evaluateAnswer(lastInterimTranscript.replace(/\s/g, ''), lastInterimAlts);
-      return;
+    if (!evaluationDone) {
+      if (bestTranscript) finish(bestTranscript, bestAlts);
+      else resetMicState();
     }
-    // Nothing heard at all on Safari — guide the user
-    if (!evaluationDone && !abortRequested && !gotAnyResult && isSafari) {
-      setFeedback("🦁 Couldn't hear anything. On Mac Safari, Siri must be on: System Settings → Siri & Spotlight → enable Ask Siri.");
-    }
-    abortRequested = false;
-    isListening = false;
-    micBtn('idle');
-    document.getElementById('micHint').textContent = 'Tap mic, then say the word';
   };
 
-  recognition.start();
+  try {
+    rec.start();
+  } catch(e) {
+    // start() can throw if a previous session didn't fully release; reset and let user retap
+    resetMicState();
+  }
+}
+
+// Reset mic UI/state without touching recognitionId (used for clean idle)
+function resetMicState() {
+  isListening = false;
+  micBtn('idle');
+  document.getElementById('micHint').textContent = 'Tap mic, then say the word';
 }
 
 function stopListening() {
   clearTimeout(safetyTimer);
+  recognitionId++;  // invalidate any in-flight callbacks
   if (recognition) {
-    abortRequested = true;
+    try { recognition.onresult = recognition.onend = recognition.onerror = null; } catch(e) {}
     try { recognition.abort(); } catch(e) {}
     recognition = null;
   }
@@ -796,9 +822,7 @@ function stopListening() {
     try { mediaRecorder.stop(); } catch(e) {}
     mediaRecorder = null;
   }
-  isListening = false;
-  micBtn('idle');
-  document.getElementById('micHint').textContent = 'Tap mic, then say the word';
+  resetMicState();
 }
 
 function micBtn(mode) {
@@ -830,16 +854,39 @@ function bestMatch(transcript, target) {
   return t.length > 3 ? t.slice(-3) : t;
 }
 
+// Resolve a raw transcript to a candidate 3-letter word.
+// Order matters: check the homophone map on the FULL word first
+// (e.g. "lead" -> "led", "read" -> "red"), since those entries are
+// longer than 3 letters and would be destroyed by trimming.
+// Also handle multi-word transcripts by checking each token.
+function resolveWord(transcript, target) {
+  if (!transcript) return transcript;
+  const raw = transcript.trim().toLowerCase();
+
+  // 1. whole-string homophone hit
+  if (HOMOPHONE_MAP[raw]) return HOMOPHONE_MAP[raw];
+
+  // 2. per-token homophone hit (e.g. "the lead" -> "led")
+  const tokens = raw.split(/\s+/);
+  for (const tok of tokens) {
+    if (HOMOPHONE_MAP[tok]) return HOMOPHONE_MAP[tok];
+  }
+
+  // 3. trim to a 3-letter candidate, then re-check homophones
+  const trimmed = bestMatch(raw, target);
+  return HOMOPHONE_MAP[trimmed] || trimmed;
+}
+
 function evaluateAnswer(heard, alternatives) {
   stopListening();
   const target = currentWord.toLowerCase();
-  // Try to extract a clean 3-letter match from what was heard
-  const cleanHeard = bestMatch(heard, target);
-  const normalizedHeard = HOMOPHONE_MAP[cleanHeard] || cleanHeard;
+  // Resolve heard transcript to a 3-letter candidate (homophone-aware)
+  const normalizedHeard = resolveWord(heard, target);
+  const cleanHeard = normalizedHeard;  // for letter-highlighting display
   const correct = normalizedHeard === target;
 
   // Track per-letter accuracy
-  const cleanAlts = alternatives.map(a => { const b = bestMatch(a, target); return HOMOPHONE_MAP[b] || b; });
+  const cleanAlts = alternatives.map(a => resolveWord(a, target));
   updateLetterAccuracy(target, normalizedHeard, cleanAlts);
 
   if (correct) {
@@ -858,15 +905,15 @@ function evaluateAnswer(heard, alternatives) {
 
     if (correctSinceLastDragon >= DRAGON_EVERY) {
       correctSinceLastDragon = 0;
-      setTimeout(() => showDragon(), 1200);
+      setTimeout(() => showDragon(), 1000);
     } else {
-      setTimeout(() => pickWord(), 1400);
+      setTimeout(() => pickWord(), 900);
     }
   } else {
     micBtn('wrong');
-    renderBlanks(false, heard);
+    renderBlanks(false, cleanHeard);
     setFeedback(`Not quite! The word is "${currentWord.toUpperCase()}". Try again!`);
-    if (state.apiKey) getAIFeedback(currentWord, false, heard);
+    if (state.apiKey) getAIFeedback(currentWord, false, cleanHeard);
     setTimeout(() => micBtn('idle'), 800);
   }
 }
