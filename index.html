@@ -813,15 +813,34 @@ function micBtn(mode) {
 // ═══════════════════════════════════════════════════════════════
 //  EVALUATION
 // ═══════════════════════════════════════════════════════════════
+// Extract the best 3-letter match from a transcript against the target.
+// If speech recognition returns e.g. "smug" when target is "mug",
+// check if any 3-letter substring equals the target.
+function bestMatch(transcript, target) {
+  if (!transcript) return transcript;
+  const t = transcript.replace(/\s+/g, '').toLowerCase();
+  if (t.length === 3) return t;
+  if (target) {
+    // scan all 3-char substrings for an exact match
+    for (let i = 0; i <= t.length - 3; i++) {
+      if (t.slice(i, i + 3) === target) return target;
+    }
+  }
+  // fall back to last 3 chars (most likely the root word)
+  return t.length > 3 ? t.slice(-3) : t;
+}
+
 function evaluateAnswer(heard, alternatives) {
   stopListening();
   const target = currentWord.toLowerCase();
-  // Normalize heard word through homophone map so e.g. "lead" → "led"
-  const normalizedHeard = HOMOPHONE_MAP[heard] || heard;
+  // Try to extract a clean 3-letter match from what was heard
+  const cleanHeard = bestMatch(heard, target);
+  const normalizedHeard = HOMOPHONE_MAP[cleanHeard] || cleanHeard;
   const correct = normalizedHeard === target;
 
-  // Track per-letter accuracy — use normalized form so a homophone match scores as fully correct
-  updateLetterAccuracy(target, normalizedHeard, alternatives.map(a => HOMOPHONE_MAP[a] || a));
+  // Track per-letter accuracy
+  const cleanAlts = alternatives.map(a => { const b = bestMatch(a, target); return HOMOPHONE_MAP[b] || b; });
+  updateLetterAccuracy(target, normalizedHeard, cleanAlts);
 
   if (correct) {
     micBtn('correct');
