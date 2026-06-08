@@ -99,6 +99,14 @@
       background: rgba(255,255,255,0.18); transform: scale(0.95);
     }
 
+    .override-btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      margin-top: 4px; padding: 8px 16px; border-radius: 20px;
+      border: 1px solid rgba(76,255,114,0.5); background: rgba(76,255,114,0.12);
+      color: #4cff72; font-size: 0.85rem; cursor: pointer; transition: all 0.15s;
+    }
+    .override-btn:hover, .override-btn:active { background: rgba(76,255,114,0.22); }
+
     /* mic button */
     .mic-btn {
       width: 90px; height: 90px; border-radius: 50%; border: none;
@@ -308,6 +316,8 @@
     <button class="skip-btn" id="skipBtn" onclick="skipWord()" title="Skip this word">⏭</button>
   </div>
   <div class="mic-hint" id="micHint">Tap mic, then say the word</div>
+
+  <button class="override-btn" id="overrideBtn" onclick="teacherOverride()" style="display:none;">✓ They read it right — mark correct</button>
 
   <div class="feedback-box" id="feedbackBox">Get started — tap the mic and read a word!</div>
 
@@ -540,6 +550,7 @@ function pickWord() {
   renderBlanks(false);
   document.getElementById('wordLabel').textContent = 'Tap the mic to hear a word';
   document.getElementById('heardText').textContent = '';
+  hideOverride();
 }
 
 // Skip the current word — for when the recognizer can't hear the child
@@ -728,6 +739,7 @@ let sessionTranscript = '';   // best transcript captured so far this session
 let sessionAlts = [];
 let sessionEvalRequested = false;  // true once we detect a final/confident match
 let awaitingNextWord = false; // true between correct answer and pickWord firing
+let lastAttempt = null;       // records last word's per-letter scoring for teacher override
 
 function buildSR() {
   if (SR_INSTANCE) return SR_INSTANCE;
@@ -826,6 +838,7 @@ function startListening() {
   // Ignore taps while a word transition is pending (e.g. user mashes mic
   // between "correct" feedback and the next word appearing).
   if (awaitingNextWord) return;
+  hideOverride();
 
   if (!wordShown) {
     wordShown = true;
@@ -948,34 +961,79 @@ function evaluateAnswer(heard, alternatives) {
   updateLetterAccuracy(target, normalizedHeard, cleanAlts);
 
   if (correct) {
-    micBtn('correct');
-    state.xp += xpForDiff();
-    state.correctTotal++;
-    correctSinceLastDragon++;
-    const prizeJustUnlocked = checkPrizes();
-    saveState();
-    updateHUD();
-    if (!prizeJustUnlocked) {
-      setFeedback(`✅ "${currentWord.toUpperCase()}" — fantastic reading, ${state.name}!`);
-    }
-    if (state.apiKey) getAIFeedback(currentWord, true);
-    renderBlanks(true);
-
-    if (correctSinceLastDragon >= DRAGON_EVERY) {
-      correctSinceLastDragon = 0;
-      awaitingNextWord = true;
-      setTimeout(() => { awaitingNextWord = false; showDragon(); }, 1000);
-    } else {
-      awaitingNextWord = true;
-      setTimeout(() => { awaitingNextWord = false; pickWord(); }, 900);
-    }
+    awardCorrect();
   } else {
     micBtn('wrong');
     renderBlanks(false, cleanHeard);
     setFeedback(`Not quite! The word is "${currentWord.toUpperCase()}". Try again!`);
     if (state.apiKey) getAIFeedback(currentWord, false, cleanHeard);
     setTimeout(() => micBtn('idle'), 800);
+    // Offer a teacher override in case the app misheard a correct reading
+    showOverride();
   }
+}
+
+// Award credit for the current word (used by both correct recognition
+// and the teacher "mark correct" override).
+function awardCorrect() {
+  hideOverride();
+  micBtn('correct');
+  state.xp += xpForDiff();
+  state.correctTotal++;
+  correctSinceLastDragon++;
+  const prizeJustUnlocked = checkPrizes();
+  saveState();
+  updateHUD();
+  if (!prizeJustUnlocked) {
+    setFeedback(`✅ "${currentWord.toUpperCase()}" — fantastic reading, ${state.name}!`);
+  }
+  if (state.apiKey) getAIFeedback(currentWord, true);
+  renderBlanks(true);
+
+  if (correctSinceLastDragon >= DRAGON_EVERY) {
+    correctSinceLastDragon = 0;
+    awaitingNextWord = true;
+    setTimeout(() => { awaitingNextWord = false; showDragon(); }, 1000);
+  } else {
+    awaitingNextWord = true;
+    setTimeout(() => { awaitingNextWord = false; pickWord(); }, 900);
+  }
+}
+
+// Teacher override: child read it right but the app misheard.
+function teacherOverride() {
+  // Precisely reverse the last recorded attempt, then credit a clean correct read.
+  if (lastAttempt && lastAttempt.hits) {
+    lastAttempt.hits.forEach(({ letter, posKey, wasCorrect }) => {
+      const lh = state.letterHits[letter];
+      if (lh) { lh.total = Math.max(0, lh.total - 1); if (wasCorrect) lh.correct = Math.max(0, lh.correct - 1); }
+      const lp = state.letterPos && state.letterPos[posKey];
+      if (lp) { lp.total = Math.max(0, lp.total - 1); if (wasCorrect) lp.correct = Math.max(0, lp.correct - 1); }
+    });
+  }
+  // Credit the current word as a clean correct read (every letter right)
+  const target = currentWord.toLowerCase();
+  if (!state.letterPos) state.letterPos = {};
+  for (let i = 0; i < target.length; i++) {
+    const L = target[i];
+    if (!state.letterHits[L]) state.letterHits[L] = { correct: 0, total: 0 };
+    state.letterHits[L].correct++; state.letterHits[L].total++;
+    const posKey = L + i;
+    if (!state.letterPos[posKey]) state.letterPos[posKey] = { correct: 0, total: 0 };
+    state.letterPos[posKey].correct++; state.letterPos[posKey].total++;
+  }
+  lastAttempt = null;
+  renderLetterGrid();
+  awardCorrect();
+}
+
+function showOverride() {
+  const btn = document.getElementById('overrideBtn');
+  if (btn) btn.style.display = 'inline-flex';
+}
+function hideOverride() {
+  const btn = document.getElementById('overrideBtn');
+  if (btn) btn.style.display = 'none';
 }
 
 function xpForDiff() {
@@ -987,6 +1045,7 @@ function xpForDiff() {
 // ═══════════════════════════════════════════════════════════════
 function updateLetterAccuracy(target, topHeard, alternatives) {
   if (!state.letterPos) state.letterPos = {};
+  lastAttempt = { target, hits: [] };  // record for possible teacher override
   for (let i = 0; i < target.length; i++) {
     const letter = target[i];
     // overall hits
@@ -1000,6 +1059,8 @@ function updateLetterAccuracy(target, topHeard, alternatives) {
     if (!state.letterPos[posKey]) state.letterPos[posKey] = { correct: 0, total: 0 };
     state.letterPos[posKey].total++;
     if (hit) state.letterPos[posKey].correct++;
+
+    lastAttempt.hits.push({ letter, posKey, wasCorrect: hit });
   }
   renderLetterGrid();
 }
